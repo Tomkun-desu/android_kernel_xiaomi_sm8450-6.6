@@ -1,0 +1,235 @@
+name: Build Kernel (KernelSU-Next + SUSFS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Custom build tag (optional) - added to the zip and artifact name"
+        required: false
+        default: ""
+        type: string
+      susfs_commit:
+        description: "SUSFS commit/ref from GitLab simonpunk/susfs4ksu (empty = latest of gki-android15-6.6)"
+        required: false
+        default: ""
+        type: string
+      ksu_commit:
+        description: "KernelSU-Next commit/ref from GitHub pershoot/KernelSU-Next (empty = latest of dev-susfs)"
+        required: false
+        default: ""
+        type: string
+  push:
+    branches: [lineage-24.0-6.6]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+
+    env:
+      DEVICE: ingres
+      CLANG_TAG: android-15.0.0_r3
+      CLANG_VER: clang-r510928
+      KSU_REPO: https://github.com/pershoot/KernelSU-Next
+      KSU_BRANCH: dev-susfs
+      SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu
+      SUSFS_BRANCH: gki-android15-6.6
+      VENDOR_CONFIG: arch/arm64/configs/vendor/waipio_perf.config
+      BUILD_TAG: ${{ inputs.tag }}
+      SUSFS_COMMIT: ${{ inputs.susfs_commit }}
+      KSU_COMMIT: ${{ inputs.ksu_commit }}
+
+    steps:
+      - name: Checkout kernel
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve build tag
+        id: tag
+        run: |
+          TAG="${BUILD_TAG//[^A-Za-z0-9._-]/-}"
+          echo "suffix=${TAG:+-$TAG}" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY/CodeQL"
+          df -h /
+
+      - name: Add swap (ThinLTO link needs more than 16 GB)
+        run: |
+          swapon --show
+          sudo rm -f /swapfile-ci
+          sudo fallocate -l 16G /swapfile-ci || sudo dd if=/dev/zero of=/swapfile-ci bs=1M count=16384 status=none
+          sudo chmod 600 /swapfile-ci
+          sudo mkswap /swapfile-ci
+          sudo swapon /swapfile-ci
+          swapon --show
+          cat /proc/meminfo | head -3
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev dwarves zip unzip cpio rsync
+          sudo apt-get install -y --no-install-recommends libtinfo5 || true
+
+      - name: Install AOSP clang ${{ env.CLANG_VER }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/toolchain"
+          curl -fsSL --retry 3 -o /tmp/clang.tar.gz \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/${CLANG_TAG}/${CLANG_VER}.tar.gz"
+          tar -xzf /tmp/clang.tar.gz -C "$HOME/toolchain"
+          echo "$HOME/toolchain/bin" >> "$GITHUB_PATH"
+          "$HOME/toolchain/bin/clang" --version
+
+      - name: Add KernelSU-Next
+        run: |
+          set -euo pipefail
+          git clone -q -b "$KSU_BRANCH" "$KSU_REPO" KernelSU-Next
+          if [ -n "$KSU_COMMIT" ]; then
+            git -C KernelSU-Next fetch -q --depth 1 origin "$KSU_COMMIT"
+            git -C KernelSU-Next checkout -q FETCH_HEAD
+          fi
+          git -C KernelSU-Next log -1 --format='KernelSU-Next %H %ad %s' --date=short
+          ln -sfn ../KernelSU-Next/kernel drivers/kernelsu
+          printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig ||
+            sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+      - name: Add SUSFS
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none -b "$SUSFS_BRANCH" "$SUSFS_REPO" /tmp/susfs4ksu
+          if [ -n "$SUSFS_COMMIT" ]; then
+            git -C /tmp/susfs4ksu fetch -q origin "$SUSFS_COMMIT"
+            git -C /tmp/susfs4ksu checkout -q FETCH_HEAD
+          fi
+          echo "SUSFS $(sed -n 's/^#define SUSFS_VERSION "\(.*\)"/\1/p' /tmp/susfs4ksu/kernel_patches/include/linux/susfs.h) at $(git -C /tmp/susfs4ksu rev-parse --short HEAD) $(git -C /tmp/susfs4ksu log -1 --format='%ad %s' --date=short)"
+
+          cp /tmp/susfs4ksu/kernel_patches/fs/susfs.c fs/susfs.c
+          cp /tmp/susfs4ksu/kernel_patches/include/linux/susfs.h \
+             /tmp/susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/
+          patch -p1 --fuzz=3 --forward < "/tmp/susfs4ksu/kernel_patches/50_add_susfs_in_${SUSFS_BRANCH}.patch"
+
+      - name: Verify source pairing
+        run: |
+          set -euo pipefail
+          SUSFS_VER=$(sed -n 's/^#define SUSFS_VERSION "\(.*\)"/\1/p' include/linux/susfs.h)
+          KSU_ABI_VER=$(sed -n 's/.*SUSFS_VERSION_STR "\(.*\)".*/\1/p' KernelSU-Next/kernel/susfs/susfs_abi.h | head -1)
+          echo "kernel SUSFS: $SUSFS_VER / KSU ABI: $KSU_ABI_VER"
+          [ -n "$SUSFS_VER" ] && [ -n "$KSU_ABI_VER" ]
+          if [ "$SUSFS_VER" != "$KSU_ABI_VER" ]; then
+            newest=$(printf '%s\n%s\n' "${SUSFS_VER#v}" "${KSU_ABI_VER#v}" | sort -V | tail -1)
+            [ "$newest" = "${SUSFS_VER#v}" ] ||
+              { echo "kernel SUSFS $SUSFS_VER is older than KernelSU-Next ABI $KSU_ABI_VER"; exit 1; }
+            echo "::warning::kernel SUSFS $SUSFS_VER, KernelSU-Next ABI $KSU_ABI_VER; building latest of both"
+          fi
+          test -f fs/susfs.c
+          grep -q 'susfs.o' fs/Makefile
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 TARGET_PRODUCT="$DEVICE" gki_defconfig
+          scripts/kconfig/merge_config.sh -m -O out out/.config "$VENDOR_CONFIG"
+          scripts/config --file out/.config \
+            -e KSU -e KSU_SUSFS \
+            -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT -e KSU_SUSFS_SUS_KSTAT \
+            -e KSU_SUSFS_SUS_MAP -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_ENABLE_LOG \
+            -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
+            -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG -e KSU_SUSFS_OPEN_REDIRECT
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 TARGET_PRODUCT="$DEVICE" olddefconfig
+          grep -E '^CONFIG_KSU|^CONFIG_KSU_SUSFS' out/.config
+
+      - name: Build Image
+        run: |
+          ( while sleep 120; do echo "[build] still compiling $(date -u +%H:%M:%S)"; done ) &
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 TARGET_PRODUCT="$DEVICE" \
+            LD="ld.lld --thinlto-jobs=2" -j"$(nproc)" Image
+
+      - name: Verify image and config
+        run: |
+          set -euo pipefail
+          [ -s out/arch/arm64/boot/Image ] || { echo "MISSING: out/arch/arm64/boot/Image"; exit 1; }
+          [ -s out/fs/susfs.o ] || { echo "MISSING: out/fs/susfs.o"; exit 1; }
+          [ -s out/drivers/kernelsu/built-in.a ] || { echo "MISSING: out/drivers/kernelsu/built-in.a"; exit 1; }
+          grep -qx 'CONFIG_KSU=y' out/.config || { echo "CONFIG_KSU is not y:"; grep KSU out/.config; exit 1; }
+          grep -qx 'CONFIG_KSU_SUSFS=y' out/.config || { echo "CONFIG_KSU_SUSFS is not y:"; grep SUSFS out/.config; exit 1; }
+          echo "kernelrelease: $(cat out/include/config/kernel.release)"
+
+      - name: Package flashable zip
+        env:
+          TAG_SUFFIX: ${{ steps.tag.outputs.suffix }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ZIP="SM8450-${DEVICE}-KSU-SUSFS${TAG_SUFFIX}.zip"
+          git clone --depth 1 https://github.com/osm0sis/AnyKernel3 /tmp/ak3
+          cp out/arch/arm64/boot/Image /tmp/ak3/Image
+          sed -i \
+            -e 's/^kernel.string=.*/kernel.string=SM8450 (ingres) KernelSU-Next + SUSFS/' \
+            -e 's/^do.devicecheck=.*/do.devicecheck=0/' \
+            -e 's/^do.modules=.*/do.modules=0/' \
+            -e 's/^BLOCK=.*/BLOCK=boot;/' \
+            -e 's/^IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=auto;/' \
+            -e 's/^RAMDISK_COMPRESSION=.*/RAMDISK_COMPRESSION=auto;/' \
+            -e 's/^PATCH_VBMETA_FLAG=.*/PATCH_VBMETA_FLAG=auto;/' \
+            /tmp/ak3/anykernel.sh
+          {
+            echo "device=$DEVICE"
+            echo "kernel=$(cat out/include/config/kernel.release)"
+            echo "repo=${GITHUB_REPOSITORY}"
+            echo "branch=${GITHUB_REF_NAME}"
+            echo "commit=$(git rev-parse --short HEAD)"
+            echo "ksu=$(git -C KernelSU-Next rev-parse --short HEAD) ($KSU_BRANCH)"
+            echo "susfs=$(git -C /tmp/susfs4ksu rev-parse --short HEAD) ($SUSFS_BRANCH)"
+            echo "tag=${TAG_SUFFIX#-}"
+            echo "clang=$CLANG_VER"
+          } > /tmp/ak3/BuildInfo
+          (cd /tmp/ak3 && zip -r9 "$GITHUB_WORKSPACE/dist/$ZIP" . -x '.git/*')
+          (cd dist && sha256sum "$ZIP" > "$ZIP.sha256")
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SM8450-${{ env.DEVICE }}-KSU-SUSFS${{ steps.tag.outputs.suffix }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Build summary
+        if: always()
+        env:
+          TAG_SUFFIX: ${{ steps.tag.outputs.suffix }}
+        run: |
+          KERNEL_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo n/a)
+          KREL=$(cat out/include/config/kernel.release 2>/dev/null || echo n/a)
+          KSU_SHA=$(git -C KernelSU-Next rev-parse --short HEAD 2>/dev/null || echo n/a)
+          KSU_FULL=$(git -C KernelSU-Next rev-parse HEAD 2>/dev/null || echo "")
+          SUSFS_SHA=$(git -C /tmp/susfs4ksu rev-parse --short HEAD 2>/dev/null || echo n/a)
+          SUSFS_FULL=$(git -C /tmp/susfs4ksu rev-parse HEAD 2>/dev/null || echo "")
+          SUSFS_VER=$(sed -n 's/^#define SUSFS_VERSION "\(.*\)"/\1/p' /tmp/susfs4ksu/kernel_patches/include/linux/susfs.h 2>/dev/null)
+          ZIP="SM8450-${DEVICE}-KSU-SUSFS${TAG_SUFFIX}.zip"
+          {
+            echo "## SM8450 ($DEVICE) - KernelSU-Next + SUSFS (6.6)"
+            echo ""
+            echo "- result: **${{ job.status }}**"
+            echo "- kernel: \`$KERNEL_SHA\` (${GITHUB_REF_NAME}), release \`$KREL\`"
+            echo "- KernelSU-Next: \`$KSU_SHA\` (${KSU_BRANCH})"
+            echo "- SUSFS: \`$SUSFS_SHA\` ${SUSFS_VER:-unknown} (${SUSFS_BRANCH})"
+            echo "- clang: ${CLANG_VER}, tag: \`${TAG_SUFFIX#-}\`"
+            echo "- artifact: \`SM8450-${DEVICE}-KSU-SUSFS${TAG_SUFFIX}\`"
+            [ -f "dist/$ZIP.sha256" ] && echo "- sha256: \`$(cut -d' ' -f1 "dist/$ZIP.sha256")\`"
+            echo "- reproduce this build: \`susfs_commit=$SUSFS_FULL\` \`ksu_commit=$KSU_FULL\`"
+            echo ""
+            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } >> "$GITHUB_STEP_SUMMARY"
