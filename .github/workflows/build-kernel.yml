@@ -18,6 +18,11 @@ on:
         required: false
         default: ""
         type: string
+      kernel_release:
+        description: "ROM kernel release suffix after 6.6.144, from `uname -r` on the device (keeps stock modules loadable)"
+        required: false
+        default: "android15-8-g947a907cfa70-4k"
+        type: string
   push:
     branches: [lineage-24.0-6.6]
 
@@ -45,6 +50,7 @@ jobs:
       BUILD_TAG: ${{ inputs.tag }}
       SUSFS_COMMIT: ${{ inputs.susfs_commit }}
       KSU_COMMIT: ${{ inputs.ksu_commit }}
+      KERNEL_RELEASE: ${{ inputs.kernel_release || 'android15-8-g947a907cfa70-4k' }}
 
     steps:
       - name: Checkout kernel
@@ -155,6 +161,9 @@ jobs:
           set -euo pipefail
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 TARGET_PRODUCT="$DEVICE" gki_defconfig
           scripts/kconfig/merge_config.sh -m -O out out/.config "$VENDOR_CONFIG"
+          if [ -n "$KERNEL_RELEASE" ]; then
+            scripts/config --file out/.config --set-str LOCALVERSION "-${KERNEL_RELEASE#-}"
+          fi
           scripts/config --file out/.config \
             -d DEBUG_INFO_COMPRESSED_ZSTD -e DEBUG_INFO_COMPRESSED_NONE \
             -e KSU -e KSU_SUSFS \
@@ -162,13 +171,13 @@ jobs:
             -e KSU_SUSFS_SUS_MAP -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_ENABLE_LOG \
             -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
             -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG -e KSU_SUSFS_OPEN_REDIRECT
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 TARGET_PRODUCT="$DEVICE" olddefconfig
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 TARGET_PRODUCT="$DEVICE" LOCALVERSION= olddefconfig
           grep -E '^CONFIG_KSU|^CONFIG_KSU_SUSFS' out/.config
 
       - name: Build Image
         run: |
           ( while sleep 120; do echo "[build] still compiling $(date -u +%H:%M:%S)"; done ) &
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 TARGET_PRODUCT="$DEVICE" \
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 TARGET_PRODUCT="$DEVICE" LOCALVERSION= \
             LD="ld.lld --thinlto-jobs=2" -j"$(nproc)" Image
 
       - name: Verify image and config
@@ -179,7 +188,11 @@ jobs:
           [ -s out/drivers/kernelsu/built-in.a ] || { echo "MISSING: out/drivers/kernelsu/built-in.a"; exit 1; }
           grep -qx 'CONFIG_KSU=y' out/.config || { echo "CONFIG_KSU is not y:"; grep KSU out/.config; exit 1; }
           grep -qx 'CONFIG_KSU_SUSFS=y' out/.config || { echo "CONFIG_KSU_SUSFS is not y:"; grep SUSFS out/.config; exit 1; }
-          echo "kernelrelease: $(cat out/include/config/kernel.release)"
+          KREL=$(cat out/include/config/kernel.release)
+          echo "kernelrelease: $KREL"
+          if [ -n "$KERNEL_RELEASE" ]; then
+            case "$KREL" in *"${KERNEL_RELEASE#-}") ;; *) echo "kernelrelease does not match ROM release $KERNEL_RELEASE"; exit 1;; esac
+          fi
 
       - name: Package flashable zip
         env:
