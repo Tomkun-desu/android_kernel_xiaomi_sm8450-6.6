@@ -82,6 +82,19 @@ jobs:
             bc bison flex libssl-dev libelf-dev dwarves zip unzip cpio rsync
           sudo apt-get install -y --no-install-recommends libtinfo5 || true
 
+      - name: Install pahole (jammy's 1.25 cannot read clang 18 BTF)
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends cmake libdw-dev zlib1g-dev libzstd-dev pkg-config
+          git clone -q --depth 1 -b v1.27 https://git.kernel.org/pub/scm/devel/pahole/pahole.git /tmp/pahole
+          git -C /tmp/pahole submodule update -q --init --recursive --depth 1
+          cmake -S /tmp/pahole -B /tmp/pahole/build \
+            -DCMAKE_BUILD_TYPE=Release -D__LIB=lib -DBUILD_SHARED_LIBS=OFF
+          cmake --build /tmp/pahole/build -j"$(nproc)"
+          sudo cmake --install /tmp/pahole/build
+          hash -r
+          pahole --version
+
       - name: Install AOSP clang ${{ env.CLANG_VER }}
         run: |
           set -euo pipefail
