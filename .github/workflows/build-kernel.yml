@@ -82,7 +82,7 @@ jobs:
             bc bison flex libssl-dev libelf-dev dwarves zip unzip cpio rsync
           sudo apt-get install -y --no-install-recommends libtinfo5 || true
 
-      - name: Install pahole (jammy's 1.25 cannot read clang 18 BTF)
+      - name: Install pahole 1.27
         run: |
           set -euo pipefail
           sudo apt-get install -y --no-install-recommends cmake libdw-dev zlib1g-dev libzstd-dev pkg-config
@@ -156,6 +156,7 @@ jobs:
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 TARGET_PRODUCT="$DEVICE" gki_defconfig
           scripts/kconfig/merge_config.sh -m -O out out/.config "$VENDOR_CONFIG"
           scripts/config --file out/.config \
+            -d DEBUG_INFO_COMPRESSED_ZSTD -e DEBUG_INFO_COMPRESSED_NONE \
             -e KSU -e KSU_SUSFS \
             -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT -e KSU_SUSFS_SUS_KSTAT \
             -e KSU_SUSFS_SUS_MAP -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_ENABLE_LOG \
