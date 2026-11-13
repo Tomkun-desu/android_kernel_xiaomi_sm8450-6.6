@@ -157,10 +157,9 @@ jobs:
           grep -q 'susfs.o' fs/Makefile
 
       - name: Configure
-        env:
-          LOCALVERSION: ""
         run: |
           set -euo pipefail
+          export LOCALVERSION=
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 TARGET_PRODUCT="$DEVICE" gki_defconfig
           scripts/kconfig/merge_config.sh -m -O out out/.config "$VENDOR_CONFIG"
           if [ -n "$KERNEL_RELEASE" ]; then
@@ -177,9 +176,8 @@ jobs:
           grep -E '^CONFIG_KSU|^CONFIG_KSU_SUSFS' out/.config
 
       - name: Build Image
-        env:
-          LOCALVERSION: ""
         run: |
+          export LOCALVERSION=
           ( while sleep 120; do echo "[build] still compiling $(date -u +%H:%M:%S)"; done ) &
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 TARGET_PRODUCT="$DEVICE" LOCALVERSION= \
             LD="ld.lld --thinlto-jobs=2" -j"$(nproc)" Image
