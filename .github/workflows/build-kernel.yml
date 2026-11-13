@@ -92,7 +92,10 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get install -y --no-install-recommends cmake libdw-dev zlib1g-dev libzstd-dev pkg-config
-          git clone -q --depth 1 -b v1.27 https://git.kernel.org/pub/scm/devel/pahole/pahole.git /tmp/pahole
+          for i in 1 2 3; do
+            git clone -q --depth 1 -b v1.27 https://github.com/acmel/dwarves.git /tmp/pahole && break
+            rm -rf /tmp/pahole; sleep 10
+          done
           git -C /tmp/pahole submodule update -q --init --recursive --depth 1
           cmake -S /tmp/pahole -B /tmp/pahole/build \
             -DCMAKE_BUILD_TYPE=Release -D__LIB=lib -DBUILD_SHARED_LIBS=OFF
